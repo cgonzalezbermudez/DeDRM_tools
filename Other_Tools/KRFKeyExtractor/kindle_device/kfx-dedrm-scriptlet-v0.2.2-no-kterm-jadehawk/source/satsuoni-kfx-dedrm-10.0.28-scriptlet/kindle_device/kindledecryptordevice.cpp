@@ -2370,21 +2370,16 @@ std::vector<std::string> split_secrets(const std::string& secrfile)
     return result;
 }
 // length over 36 will get mid-clipped by first 16 and last 17 symbols 
-void updatemenufile(const std::vector<fs::path>&books,bool truncate,const fs::path& expected_menu,bool menu_might_not_exist=false)
+void updatemenufile(const std::vector<fs::path>&books,bool truncate)
 {
-   json data;
+  std::string expected_menu="/mnt/us/extensions/kfxdedrm-scriptlet/menu.json";
    std::ifstream file(expected_menu);
-    
-    if (!file.is_open()&&!menu_might_not_exist)
+    if (!file.is_open())
     {
-      throw std::runtime_error("Could not open file /mnt/us/extensions/kfxdedrm/menu.json for reading");
-    }
-    if(file.is_open())
-    {
-    data = json::parse(file);
+      throw std::runtime_error("Could not open file /mnt/us/extensions/kfxdedrm-scriptlet/menu.json for reading");
     }
     printf("Trying to update menu with %zu books \n",books.size());
-    
+    json data = json::parse(file);
     json alist=json::array();
     alist.push_back({{"name","Scan documents folder"},{"action", "bin/run_cmd.sh"},{"params","scan"},{"priority",1}});
     alist.push_back({{"name","Scan documents folder (truncate names)"},{"action", "bin/run_cmd.sh"},{"params","scantruncate"},{"priority",2}});
@@ -2392,10 +2387,22 @@ void updatemenufile(const std::vector<fs::path>&books,bool truncate,const fs::pa
     for(const auto& pth:books)
     {
       std::string bname=pth.stem();
-      if (truncate&&bname.length()>40)
+      std::vector<size_t> utf8_starts;
+      for (size_t i=0; i<bname.size(); )
       {
-        std::string front=bname.substr(0,16);
-        std::string back=bname.substr(bname.length()-17);
+        utf8_starts.push_back(i);
+        unsigned char c=static_cast<unsigned char>(bname[i]);
+        size_t width=1;
+        if ((c&0xE0)==0xC0) width=2;
+        else if ((c&0xF0)==0xE0) width=3;
+        else if ((c&0xF8)==0xF0) width=4;
+        if (i+width>bname.size()) width=1;
+        i+=width;
+      }
+      if (truncate&&utf8_starts.size()>40)
+      {
+        std::string front=bname.substr(0,utf8_starts[16]);
+        std::string back=bname.substr(utf8_starts[utf8_starts.size()-17]);
         bname=front+"..."+back;
         std::replace(bname.begin(), bname.end(), ' ', '_');
       }
@@ -2403,20 +2410,6 @@ void updatemenufile(const std::vector<fs::path>&books,bool truncate,const fs::pa
       alist.push_back({{"name",bname},{"action", "bin/run_cmd.sh"},{"params",std::string("dedrm \"")+fpath+"\""},{"priority",p}});
       p++;
     }
-    //need to service the case where data is empty
-    if(!data.contains("items"))
-    {
-      json sub=json::array();
-      data["items"]=json::array();
-      data["items"].push_back({{"items", json::array()}});
-      data["items"][0]["items"].push_back(  {{ "name", "Dedrm all KFX"},{"priority",1},{"action","bin/run_cmd.sh"}} );
-      data["items"][0]["items"].push_back(  {{ "name", "Create keyfile for all KFX"},{"priority",2},{"action","bin/run_cmd.sh"},{"params","keyfile"}} );
-      data["items"][0]["items"].push_back(  {{ "name", "Books"},{"priority",6},{"items",alist}} );
-      
-      
-    }
-    else 
-    {
     if (data.contains("items") && data["items"].is_array()) 
    {
      for(auto& sub:data["items"])
@@ -2435,7 +2428,6 @@ void updatemenufile(const std::vector<fs::path>&books,bool truncate,const fs::pa
    }
      }
    }
-    }
     file.close();
     std::ofstream outfile(expected_menu);
     outfile << data.dump(2); 
@@ -3400,54 +3392,28 @@ int main(int argc, char *argv[])
   std::vector<fs::path> infiles;
   std::vector<fs::path> mobifiles;
   fs::path out_folder{"/mnt/us/dedrm"};
- 
+  infolders.push_back(fs::path("/mnt/us/documents"));
 
   std::string jdsn;
   std::vector<std::string> jsecrets;
   std::string mode="decrypt_all";
   fs::path sngl;
   bool truncate=false;
-  fs::path workpath=fs::path("/mnt/us/documents");
-   fs::path menupath=fs::path("/mnt/us/extensions/kfxdedrm/menu.json");
-   bool menu_might_not_exist=false;
- fs::path  keyfile_path=fs::path("/mnt/us/dedrm/keyfile.txt");
   if (argc>1)
   {
     std::string cmd=argv[1];
     if(cmd=="test") mode="test";
-    if(cmd=="scan")
-    {      
-      mode="scan";
-      if (argc>=3)
-        workpath=fs::path(argv[2]);
-      if (argc>=4)
-      {
-        menupath=fs::path(argv[3]);
-        menu_might_not_exist=true;
-      }
-      
-    }
-    if(cmd=="scantruncate") {
-      mode="scan";truncate=true;
-      if (argc>=3)
-        workpath=fs::path(argv[2]);
-      if (argc>=4)
-      {
-        menupath=fs::path(argv[3]);
-        menu_might_not_exist=true;
-      }
-      
-      }
-    if(cmd=="keyfile") 
+    if(cmd=="scan" || cmd=="scantruncate")
     {
-      mode="keyfile";
-      if (argc>=3)
-        workpath=fs::path(argv[2]);
-       if (argc>=4)
+      mode="scan";
+      if(cmd=="scantruncate") truncate=true;
+      if(argc>2)
       {
-        keyfile_path=fs::path(argv[3]);
+        infolders.clear();
+        infolders.push_back(fs::path(std::string(argv[2])));
       }
     }
+    if(cmd=="keyfile") mode="keyfile";
     if(cmd=="dedrm") 
     {
       if(argc<3)
@@ -3455,25 +3421,11 @@ int main(int argc, char *argv[])
         printf("Requires two arguments, command and book name\n");
         return 2;
       }
-      if (argc>=4)
-      {
-        out_folder=fs::path(argv[3]);
-      }
       mode="decrypt_one";
       sngl=fs::path(std::string(argv[2]));
     }
-    if(cmd=="dedrm_all")
-    {
-      mode="decrypt_all";
-      if (argc>=3)
-        workpath=fs::path(argv[2]);
-      if (argc>=4)
-      {
-        out_folder=fs::path(argv[3]);
-      }
-    }
   }
-  infolders.push_back(workpath);
+
   if(mode=="scan")
   {
     for (auto &inpath : infolders)
@@ -3481,7 +3433,7 @@ int main(int argc, char *argv[])
     scan_folder_for_book_candidates(inpath, infiles);
     mobi_scan(inpath, infiles);
     }
-    updatemenufile(infiles,truncate,menupath,menu_might_not_exist);
+    updatemenufile(infiles,truncate);
     return 0;
   }
   // open shared library
@@ -3618,11 +3570,11 @@ int main(int argc, char *argv[])
 std::ofstream outkeyfile;
  if(mode=="keyfile")
  {
-   outkeyfile.open(keyfile_path);
+   outkeyfile.open("/mnt/us/dedrm/keyfile.txt");
  }
    {
      std::cout <<"Trying to induce secrets with fake book" <<std::endl;
-     fs::path fbook=out_folder;//fs::path("/mnt/us/dedrm/");
+     fs::path fbook=fs::path("/mnt/us/dedrm/");
       fs::path fb_path_v = fbook / "fake.voucher";
       fs::path fb_path_a = fbook / "fake.kfx";
       write_vector_to_file(fb_path_v, fake);
@@ -3735,7 +3687,7 @@ std::ofstream outkeyfile;
      for(auto mobipath:mobifiles)
      {
        std::cout << "Copying " <<mobipath <<" for inplace processing "<<std::endl;
-        fs::path out_path = out_folder / mobipath.filename();
+        fs::path out_path = fs::path("/mnt/us/dedrm/") / mobipath.filename();
         bool success = fs::copy_file(mobipath, out_path, fs::copy_options::overwrite_existing);
        
          MobiBook mb(out_path);
